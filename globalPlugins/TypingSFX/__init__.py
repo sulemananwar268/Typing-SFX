@@ -7,35 +7,22 @@ import glob
 import wx
 import addonHandler
 import api
-from random import randint
 from globalCommands import SCRCAT_CONFIG
 from ui import message
 from scriptHandler import script
 from gui import NVDASettingsDialog, guiHelper, mainFrame
 from gui.settingsDialogs import SettingsPanel
 from controlTypes import STATE_READONLY, STATE_EDITABLE
-from .create import NewPack
 from configobj.validate import VdtTypeError
-
-def get_number_sound_packs():
-	return [folder for folder in os.listdir(numbering_dir) if os.path.isdir(os.path.join(numbering_dir, folder))]
-
-def confinit():
-	confspec = {
-		"typingsnd": "boolean(default=true)",
-		"typing_sound": f"string(default={get_sounds_folders()[0]})",
-		"speak_on_protected":"boolean(default=True)",
-		"num_sound_mode": "integer(default=1, min=0, max=2)",
-		"num_speak_on_protected": "integer(default=1, min=0, max=2)",
-		"num_sound_pack": f"string(default={get_number_sound_packs()[0]})"
-	}
-	config.confspec["TypingSFX"] = confspec
 
 addonHandler.initTranslation()
 effects_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "effects", "Typing")
 numbering_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "effects", "numbering")
 controls = (8, 52, 82)
 typingProtected = api.isTypingProtected
+
+def get_number_sound_packs():
+	return [folder for folder in os.listdir(numbering_dir) if os.path.isdir(os.path.join(numbering_dir, folder))]
 
 def get_sounds_folders():
 	folders = []
@@ -60,7 +47,98 @@ def IsTypingProtected():
 	if focus.isProtected:
 		return True
 
+def confinit():
+	confspec = {
+		"typingsnd": "boolean(default=true)",
+		"typing_sound": f"string(default={get_sounds_folders()[0]})",
+		"speak_on_protected":"boolean(default=True)",
+		"num_sound_mode": "integer(default=1, min=0, max=2)",
+		"num_speak_on_protected": "integer(default=1, min=0, max=2)",
+		"num_sound_pack": f"string(default={get_number_sound_packs()[0]})"
+	}
+	config.confspec["TypingSFX"] = confspec
+
 confinit()
+
+class NewPack(wx.Dialog):
+	def __init__(self, parent, is_number_pack=False):
+		self.is_number_pack = is_number_pack
+		self.effects_dir = numbering_dir if self.is_number_pack else effects_dir
+		self.name = wx.GetTextFromUser(_("enter the new soundpack name"), _("soundpack name"))
+		if not self.name: return self.Destroy()
+		if os.path.isdir(os.path.join(self.effects_dir, self.name)):
+			return wx.MessageBox(_("This soundpack name already exists, please choose another one."), _("soundpack exists"), style=wx.ICON_ERROR)
+		super().__init__(parent, -1, _("Create a new soundpack"))
+		p = wx.Panel(self)
+		if self.is_number_pack:
+			slist = [f"{i}:: {_('no sound')}" for i in range(10)]
+		else:
+			slist = [_("back space:: ")+_("no sound"), _("space:: ")+_(" no sound"), _("return key:: ")+_("no sound"), _("typing sound:: ")+_("no sound")]
+		wx.StaticText(p, -1, _("sounds list"))
+		self.soundsList = wx.ListBox(p, -1, choices=slist)
+		ok = wx.Button(p, -1, _("create"))
+		cancel = wx.Button(p, wx.ID_CANCEL, _("cancel"))
+		self.soundsList.Selection = 0
+		ok.Bind(wx.EVT_BUTTON, self.OnOk)
+		self.Bind(wx.EVT_CHAR_HOOK, self.OnShortcuts)
+		self.Show()
+
+	def OnOk(self, event):
+		files = []
+		for i in self.soundsList.Strings:
+			try:
+				files.append(i.split("::")[1].strip())
+			except:
+				files.append("")
+		try:
+			os.mkdir(os.path.join(self.effects_dir, self.name))
+			if self.is_number_pack:
+				for i, file in enumerate(files):
+					if os.path.exists(file):
+						shutil.copy(file, os.path.join(self.effects_dir, self.name, f"{i}.wav"))
+			else:
+				for i, file in enumerate(files):
+					name = self.get_name(i)
+					if name and os.path.exists(file):
+						shutil.copy(file, os.path.join(self.effects_dir, self.name, name))
+			wx.MessageBox(_("soundpack created successfully"), _("success"))
+			self.Destroy()
+		except Exception as e:
+			return message(str(e))
+
+	def get_name(self, index):
+		if index == 0:
+			return "delete.wav"
+		elif index == 1:
+			return "space.wav"
+		elif index == 2:
+			return "return.wav"
+		elif index == 3:
+			return "typing.wav"
+		return None
+
+	def OnShortcuts(self, event):
+		key = event.GetKeyCode()
+		if key == wx.WXK_SPACE and self.FindFocus() == self.soundsList:
+			try:
+				snd = self.soundsList.StringSelection.split("::")[1].strip()
+				if os.path.exists(snd):
+					nvwave.playWaveFile(snd, True)
+			except Exception as e: message(str(e))
+		elif key == wx.WXK_RETURN and self.FindFocus() == self.soundsList:
+			self.OnList(None)
+		event.Skip()
+
+	def OnList(self, event):
+		if not self.FindFocus() == self.soundsList: return
+		path = wx.FileSelector(_("select sound"), wildcard=_("wav file(.wav)|*.wav"), parent = self)
+		if not path: return
+		sound = self.soundsList.StringSelection.split("::")[0]+":: "+path
+		index = self.soundsList.Selection
+		self.soundsList.Delete(index)
+		self.soundsList.Insert(sound, index)
+		self.soundsList.Selection = index
+
 class TypingSettingsPanel(SettingsPanel):
 	title = _("Typing SFX")
 
@@ -68,11 +146,9 @@ class TypingSettingsPanel(SettingsPanel):
 		self.hidden_controls = []
 		self.num_hidden_controls = []
 		sHelper = guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
-
 		sHelper.addItem(wx.StaticText(self, label=_("Typing Sound Mode:")))
 		self.playTypingSounds = sHelper.addItem(wx.Choice(self, choices=[_("Off"), _("On")]))
 		self.playTypingSounds.SetSelection(config.conf["TypingSFX"]["typingsnd"])
-
 		self.tlable = sHelper.addItem(wx.StaticText(self, label=_("Typing Sound Pack:")))
 		self.hidden_controls.append(self.tlable)
 		self.typingSound = sHelper.addItem(wx.Choice(self))
@@ -80,65 +156,52 @@ class TypingSettingsPanel(SettingsPanel):
 		sounds = get_sounds_folders()
 		self.typingSound.Set(sounds)
 		self.typingSound.SetStringSelection(config.conf["TypingSFX"]["typing_sound"])
-
 		self.slable = sHelper.addItem(wx.StaticText(self, label=_("sounds")))
 		self.hidden_controls.append(self.slable)
 		self.sounds = sHelper.addItem(wx.Choice(self))
 		self.hidden_controls.append(self.sounds)
-
 		sHelper.addItem(wx.StaticText(self, label=_("Number sound mode:")))
-		self.num_sound_mode_choice = sHelper.addItem(wx.Choice(self, choices=[
-			_("Off"),
-			_("On"),
-			_("On with speech")
-		]))
+		self.num_sound_mode_choice = sHelper.addItem(wx.Choice(self, choices=[_("Off"), _("On"), _("On with speech")]))
 		try:
 			self.num_sound_mode_choice.SetSelection(config.conf["TypingSFX"]["num_sound_mode"])
 		except VdtTypeError:
 			config.conf["TypingSFX"]["num_sound_mode"] = 1
 			self.num_sound_mode_choice.SetSelection(1)
-
 		self.num_speak_on_protected_label = sHelper.addItem(wx.StaticText(self, label=_("Play number sounds in protected fields:")))
 		self.num_hidden_controls.append(self.num_speak_on_protected_label)
-		self.num_speak_on_protected_choice = sHelper.addItem(wx.Choice(self, choices=[
-			_("Off"),
-			_("On"),
-			_("On with speech")
-		]))
+		self.num_speak_on_protected_choice = sHelper.addItem(wx.Choice(self, choices=[_("Off"), _("On"), _("On with speech")]))
 		self.num_hidden_controls.append(self.num_speak_on_protected_choice)
 		try:
 			self.num_speak_on_protected_choice.SetSelection(config.conf["TypingSFX"]["num_speak_on_protected"])
 		except VdtTypeError:
 			config.conf["TypingSFX"]["num_speak_on_protected"] = 1
 			self.num_speak_on_protected_choice.SetSelection(1)
-
 		self.num_sound_pack_label = sHelper.addItem(wx.StaticText(self, label=_("Number Sound Pack:")))
 		self.num_hidden_controls.append(self.num_sound_pack_label)
 		self.num_sound_pack_choice = sHelper.addItem(wx.Choice(self, choices=get_number_sound_packs()))
 		self.num_hidden_controls.append(self.num_sound_pack_choice)
 		self.num_sound_pack_choice.SetStringSelection(config.conf["TypingSFX"]["num_sound_pack"])
-
 		self.num_sounds_label = sHelper.addItem(wx.StaticText(self, label=_("Number sounds:")))
 		self.num_hidden_controls.append(self.num_sounds_label)
 		self.num_sounds_choice = sHelper.addItem(wx.Choice(self))
 		self.num_hidden_controls.append(self.num_sounds_choice)
-
 		sHelper.addItem(wx.StaticText(self, label=_("Speak passwords:")))
 		self.speakPasswords = sHelper.addItem(wx.Choice(self, choices=[_("Off"), _("On")]))
 		self.speakPasswords.SetSelection(config.conf["TypingSFX"]["speak_on_protected"])
-
+		self.create_pack_btn = sHelper.addItem(wx.Button(self, label=_("Create new typing sound pack")))
+		self.create_num_pack_btn = sHelper.addItem(wx.Button(self, label=_("Create new numbering sound pack")))
 		self.OnChangeTypingSounds(None)
 		self.onChange(None)
 		self.onNumPackChange(None)
 		self.OnNumSoundModeChange(None)
-
 		self.playTypingSounds.Bind(wx.EVT_CHOICE, self.OnChangeTypingSounds)
 		self.typingSound.Bind(wx.EVT_CHOICE, self.onChange)
 		self.sounds.Bind(wx.EVT_CHOICE, self.onPlay)
 		self.num_sound_mode_choice.Bind(wx.EVT_CHOICE, self.OnNumSoundModeChange)
 		self.num_sound_pack_choice.Bind(wx.EVT_CHOICE, self.onNumPackChange)
 		self.num_sounds_choice.Bind(wx.EVT_CHOICE, self.onNumSoundPlay)
-
+		self.create_pack_btn.Bind(wx.EVT_BUTTON, self.OnCreate)
+		self.create_num_pack_btn.Bind(wx.EVT_BUTTON, self.OnNumPackCreate)
 
 	def postInit(self):
 		self.typingSound.SetFocus()
@@ -217,7 +280,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 		NVDASettingsDialog.categoryClasses.append(TypingSettingsPanel)
-		self.sounds_counts = {}
 		self.number_sounds = {}
 		self.current_number_pack = None
 		self.load_number_sounds()
@@ -239,9 +301,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def IsEditable(self, object):
 		return (object.role in controls or STATE_EDITABLE in object.states) and not STATE_READONLY in object.states
 
-	def get_sound_path(self, sound_name):
-		return os.path.join(numbering_dir, config.conf["TypingSFX"]["num_sound_pack"], sound_name)
-
 	def event_gainFocus(self, object, nextHandler):
 		api.isTypingProtected = IsTypingProtected
 		nextHandler()
@@ -253,24 +312,20 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		except VdtTypeError:
 			num_sound_mode = 1
 			config.conf["TypingSFX"]["num_sound_mode"] = 1
-
 		if num_sound_mode != 0:
 			try:
 				num_speak_on_protected = config.conf["TypingSFX"]["num_speak_on_protected"]
 			except VdtTypeError:
 				num_speak_on_protected = 1
 				config.conf["TypingSFX"]["num_speak_on_protected"] = 1
-
 			focus = api.getFocusObject()
 			mode = num_sound_mode
 			if focus.isProtected:
 				mode = num_speak_on_protected
-
 			if mode != 0 and self.IsEditable(focus) and ch.isdigit():
 				sound_path = self.number_sounds.get(ch)
 				if not sound_path:
 					sound_path = self.number_sounds.get("default")
-
 				if sound_path:
 					nvwave.playWaveFile(sound_path, True)
 					if mode == 1:
@@ -281,7 +336,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 					elif mode == 2:
 						nextHandler()
 						return
-
 		if self.IsEditable(obj) and config.conf["TypingSFX"]["typingsnd"]:
 			if ch == " ":
 				nvwave.playWaveFile(os.path.join(effects_dir, config.conf['TypingSFX']['typing_sound'], "space.wav"), True)
@@ -290,30 +344,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			elif os.path.isfile(os.path.join(effects_dir, config.conf['TypingSFX']['typing_sound'], "return.wav")) and (ord(ch) == 13 or ch == "\n"):
 				nvwave.playWaveFile(os.path.join(effects_dir, config.conf['TypingSFX']['typing_sound'], "return.wav"), True)
 			else:
-				count = self.SoundsCount(config.conf["TypingSFX"]["typing_sound"])
-				if count > 0:
-					nvwave.playWaveFile(os.path.join(effects_dir, config.conf['TypingSFX']['typing_sound'], f"typing_{randint(1, count)}.wav"), True)
-				else:
-					nvwave.playWaveFile(os.path.join(effects_dir, config.conf['TypingSFX']['typing_sound'], "typing.wav"), True)
+				nvwave.playWaveFile(os.path.join(effects_dir, config.conf['TypingSFX']['typing_sound'], "typing.wav"), True)
 		nextHandler()
 
-	def SoundsCount(self, name):
-		if name in self.sounds_counts:
-			return self.sounds_counts[name]
-		path = f"{effects_dir}/{name}"
-		try:
-			files = len([file for file in os.listdir(path) if file.startswith("typing_")])
-			self.sounds_counts[name] = files
-			return files
-		except FileNotFoundError:
-			self.sounds_counts[name] = 0
-			return 0
-
-
-	@script(
-		description = _("Toggles the typing sounds mode."),
-		category=_("Typing SFX"),
-		gestures=["kb:nvda+shift+k"])
+	@script(description = _("Toggles the typing sounds mode."), category=_("Typing SFX"), gestures=["kb:nvda+shift+k"])
 	def script_toggle_typing_sounds(self, gesture):
 		current = config.conf["TypingSFX"]["typingsnd"]
 		if current:
@@ -323,10 +357,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			config.conf["TypingSFX"]["typingsnd"] = True
 			message(_("typing sounds on"))
 
-	@script(
-		description=_("Toggles the Number sounds mode."),
-		category="Typing SFX",
-		gesture="kb:nvda+shift+n")
+	@script(description=_("Toggles the Number sounds mode."), category="Typing SFX", gesture="kb:nvda+shift+n")
 	def script_toggleNumSounds(self, gesture):
 		num_sound_mode = config.conf["TypingSFX"]["num_sound_mode"]
 		num_sound_mode = (num_sound_mode + 1) % 3
@@ -338,27 +369,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		else:
 			message(_("Number sound on with speech"))
 
-	@script(
-		description=_("Toggles the protected sounds mode."),
-		category="Typing SFX",
-		gesture="kb:nvda+shift+o")
+	@script(description=_("Toggles the protected sounds mode."), category="Typing SFX", gesture="kb:nvda+shift+o")
 	def script_toggleNumProtectedSounds(self, gesture):
 		try:
 			num_sound_mode = config.conf["TypingSFX"]["num_sound_mode"]
 		except VdtTypeError:
 			num_sound_mode = 1
 			config.conf["TypingSFX"]["num_sound_mode"] = 1
-
 		if num_sound_mode == 0:
 			message(_("please enable the number sound first"))
 			return
-
 		try:
 			num_speak_on_protected = config.conf["TypingSFX"]["num_speak_on_protected"]
 		except VdtTypeError:
 			num_speak_on_protected = 1
 			config.conf["TypingSFX"]["num_speak_on_protected"] = 1
-
 		num_speak_on_protected = (num_speak_on_protected + 1) % 3
 		config.conf["TypingSFX"]["num_speak_on_protected"] = num_speak_on_protected
 		if num_speak_on_protected == 0:
@@ -368,10 +393,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		else:
 			message(_("Protected number sound on with speech"))
 
-	@script(
-		description = _("Toggles the protected Speak mode."),
-		category = _("Typing SFX"),
-		gestures = ["kb:nvda+shift+p"])
+	@script(description = _("Toggles the protected Speak mode."), category = _("Typing SFX"), gestures = ["kb:nvda+shift+p"])
 	def script_toggle_speak_passwords(self, gesture):
 		if config.conf["TypingSFX"]["speak_on_protected"]:
 			config.conf["TypingSFX"]["speak_on_protected"] = False
