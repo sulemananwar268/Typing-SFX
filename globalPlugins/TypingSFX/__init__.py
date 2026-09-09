@@ -30,10 +30,10 @@ effects_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "effects"
 numbering_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "effects", "numbering")
 controls = (8, 52, 82)
 typingProtected = api.isTypingProtected
-CONFIG_SECTION_WHOLE_WORD = "wholeWordEcho"
 
 _original_speak = None
 _suppress_digit_info = {"char": None, "time": 0}
+_cached_speak_on_protected = True
 
 def custom_speak(speechSequence, *args, **kwargs):
 	now = time.time()
@@ -44,7 +44,11 @@ def custom_speak(speechSequence, *args, **kwargs):
 		if isinstance(speechSequence, str):
 			clean_text = speechSequence.strip()
 		elif isinstance(speechSequence, (list, tuple)):
-			clean_text = "".join(str(item).strip() for item in speechSequence if item)
+			items = []
+			for item in speechSequence:
+				if isinstance(item, str):
+					items.append(item.strip())
+			clean_text = "".join(items)
 		clean_text = clean_text.replace(" ", "").replace("\n", "").replace("\r", "")
 		if clean_text and set(clean_text) == {target_char}:
 			return
@@ -65,11 +69,28 @@ def unhook_speech():
 
 def get_base_config_section():
 	try:
+		if "TypingSFX" not in config.conf:
+			config.conf["TypingSFX"] = {}
 		return config.conf["TypingSFX"]
 	except Exception:
 		if hasattr(config.conf, 'rootSection') and "TypingSFX" in config.conf.rootSection:
 			return config.conf.rootSection["TypingSFX"]
-		return config.conf["TypingSFX"]
+		return {}
+
+def get_nvda_profile_setting(key, default_val):
+	try:
+		sec = get_base_config_section()
+		if key in sec:
+			return sec[key]
+	except Exception:
+		pass
+	if hasattr(config.conf, 'rootSection') and "TypingSFX" in config.conf.rootSection:
+		try:
+			if key in config.conf.rootSection["TypingSFX"]:
+				return config.conf.rootSection["TypingSFX"][key]
+		except Exception:
+			pass
+	return default_val
 
 def _isWordChar(ch: str) -> bool:
 	return bool(ch) and unicodedata.category(ch)[0] in "LMN"
@@ -113,7 +134,23 @@ def _isTypedWordEchoEnabled() -> bool:
 	except ImportError:
 		return bool(mode)
 	isFocusEditable = getattr(getattr(speech, "speech", None), "isFocusEditable", None)
-	return isFocusEditable() if isFocusEditable else True
+	if isFocusEditable:
+		try:
+			return isFocusEditable()
+		except Exception:
+			pass
+	focus = api.getFocusObject()
+	if focus:
+		try:
+			if hasattr(controlTypes, 'Role') and hasattr(controlTypes.Role, 'TERMINAL') and focus.role == controlTypes.Role.TERMINAL:
+				return True
+			if hasattr(controlTypes, 'ROLE_TERMINAL') and focus.role == controlTypes.ROLE_TERMINAL:
+				return True
+			if hasattr(focus, 'isEditable') and focus.isEditable:
+				return True
+		except Exception:
+			pass
+	return True
 
 def _trailingWord(text: str) -> str:
 	end = len(text)
@@ -123,18 +160,6 @@ def _trailingWord(text: str) -> str:
 	while start > 0 and _isWordChar(text[start - 1]):
 		start -= 1
 	return text[start:end]
-
-def is_whole_word_echo_enabled():
-	try:
-		return bool(config.conf[CONFIG_SECTION_WHOLE_WORD]["enabled"])
-	except Exception:
-		return True
-
-def get_whole_word_max_length():
-	try:
-		return int(config.conf[CONFIG_SECTION_WHOLE_WORD]["maxWordLength"])
-	except Exception:
-		return 100
 
 def get_number_sound_packs():
 	return [folder for folder in os.listdir(numbering_dir) if os.path.isdir(os.path.join(numbering_dir, folder))]
@@ -155,21 +180,42 @@ def get_number_sounds(name):
 def RestoreTypingProtected():
 	api.isTypingProtected = typingProtected
 
-def get_profiles_dir():
+def get_profiles_dir(create=False):
 	try:
-		path = os.path.join(globalVars.appArgs.configPath, "Typing SFX")
+		path = os.path.join(globalVars.appArgs.configPath, "profiles", "Typing SFX")
 	except Exception:
-		path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "Typing SFX")
-	if not os.path.exists(path):
+		path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "profiles", "Typing SFX")
+	if create and not os.path.exists(path):
 		try:
 			os.makedirs(path, exist_ok=True)
 		except Exception:
 			pass
+	try:
+		old_path = os.path.join(globalVars.appArgs.configPath, "Typing SFX")
+		if os.path.isdir(old_path):
+			ini_files = [f for f in os.listdir(old_path) if f.lower().endswith(".ini")]
+			if ini_files:
+				os.makedirs(path, exist_ok=True)
+				for item in ini_files:
+					src = os.path.join(old_path, item)
+					dst = os.path.join(path, item)
+					if not os.path.exists(dst):
+						try:
+							os.replace(src, dst)
+						except Exception:
+							pass
+			try:
+				if not os.listdir(old_path):
+					os.rmdir(old_path)
+			except Exception:
+				pass
+	except Exception:
+		pass
 	return path
 
-def get_app_profile_path(app_name):
+def get_app_profile_path(app_name, create=False):
 	clean_name = str(app_name).lower().replace(".exe", "").strip()
-	return os.path.join(get_profiles_dir(), f"{clean_name}.ini")
+	return os.path.join(get_profiles_dir(create=create), f"{clean_name}.ini")
 
 def get_user_profiles():
 	p_dir = get_profiles_dir()
@@ -216,37 +262,25 @@ def load_profile(profile_name="default"):
 	number_packs = get_number_sound_packs()
 	default_num_pack = number_packs[0] if number_packs else "Default"
 
-	base_sec = get_base_config_section()
-
+	g_typingsnd = bool(get_nvda_profile_setting("typingsnd", True))
+	g_typing_sound = str(get_nvda_profile_setting("typing_sound", default_sound))
+	g_speak_on_protected = bool(get_nvda_profile_setting("speak_on_protected", True))
+	g_protected_symbol = str(get_nvda_profile_setting("protected_symbol", ""))
 	try:
-		g_typingsnd = bool(base_sec["typingsnd"])
-	except Exception:
-		g_typingsnd = True
-	try:
-		g_typing_sound = str(base_sec["typing_sound"])
-	except Exception:
-		g_typing_sound = default_sound
-	try:
-		g_speak_on_protected = bool(base_sec["speak_on_protected"])
-	except Exception:
-		g_speak_on_protected = True
-	try:
-		g_num_sound_mode = int(base_sec["num_sound_mode"])
+		g_num_sound_mode = int(get_nvda_profile_setting("num_sound_mode", 1))
 	except Exception:
 		g_num_sound_mode = 1
 	try:
-		g_num_speak_on_protected = int(base_sec["num_speak_on_protected"])
+		g_num_speak_on_protected = int(get_nvda_profile_setting("num_speak_on_protected", 1))
 	except Exception:
 		g_num_speak_on_protected = 1
-	try:
-		g_num_sound_pack = str(base_sec["num_sound_pack"])
-	except Exception:
-		g_num_sound_pack = default_num_pack
+	g_num_sound_pack = str(get_nvda_profile_setting("num_sound_pack", default_num_pack))
 
 	cfg = {
 		"typingsnd": g_typingsnd,
 		"typing_sound": g_typing_sound,
 		"speak_on_protected": g_speak_on_protected,
+		"protected_symbol": g_protected_symbol,
 		"num_sound_mode": g_num_sound_mode,
 		"num_speak_on_protected": g_num_speak_on_protected,
 		"num_sound_pack": g_num_sound_pack,
@@ -268,6 +302,8 @@ def load_profile(profile_name="default"):
 					cfg["typing_sound"] = sec.get("typing_sound", fallback=cfg["typing_sound"])
 				if "speak_on_protected" in sec:
 					cfg["speak_on_protected"] = sec.getboolean("speak_on_protected", fallback=cfg["speak_on_protected"])
+				if "protected_symbol" in sec:
+					cfg["protected_symbol"] = str(sec.get("protected_symbol", fallback=cfg["protected_symbol"]))
 				if "num_sound_mode" in sec:
 					cfg["num_sound_mode"] = sec.getint("num_sound_mode", fallback=cfg["num_sound_mode"])
 				if "num_speak_on_protected" in sec:
@@ -280,16 +316,20 @@ def load_profile(profile_name="default"):
 	return cfg
 
 def save_profile(profile_name, cfg_data):
+	global _cached_speak_on_protected
 	profile_name = str(profile_name).lower().replace(".exe", "").strip()
+	if "speak_on_protected" in cfg_data:
+		_cached_speak_on_protected = bool(cfg_data["speak_on_protected"])
 	if profile_name == "default":
 		try:
+			sec = get_base_config_section()
 			for k, v in cfg_data.items():
-				config.conf["TypingSFX"][k] = v
+				sec[k] = v
 			config.conf.save()
 		except Exception as e:
 			logHandler.log.exception("Error saving NVDA profile config: %s" % e)
 	else:
-		ini_path = get_app_profile_path(profile_name)
+		ini_path = get_app_profile_path(profile_name, create=True)
 		try:
 			cp = configparser.ConfigParser()
 			disp_name = profile_name
@@ -301,14 +341,19 @@ def save_profile(profile_name, cfg_data):
 						disp_name = existing_cp["TypingSFX"]["display_name"]
 				except Exception:
 					pass
+
+			current_cfg = load_profile(profile_name)
+			current_cfg.update(cfg_data)
+
 			cp["TypingSFX"] = {
 				"display_name": str(disp_name),
-				"typingsnd": str(cfg_data["typingsnd"]),
-				"typing_sound": str(cfg_data["typing_sound"]),
-				"speak_on_protected": str(cfg_data["speak_on_protected"]),
-				"num_sound_mode": str(cfg_data["num_sound_mode"]),
-				"num_speak_on_protected": str(cfg_data["num_speak_on_protected"]),
-				"num_sound_pack": str(cfg_data["num_sound_pack"]),
+				"typingsnd": str(current_cfg["typingsnd"]),
+				"typing_sound": str(current_cfg["typing_sound"]),
+				"speak_on_protected": str(current_cfg["speak_on_protected"]),
+				"protected_symbol": str(current_cfg.get("protected_symbol", "")),
+				"num_sound_mode": str(current_cfg["num_sound_mode"]),
+				"num_speak_on_protected": str(current_cfg["num_speak_on_protected"]),
+				"num_sound_pack": str(current_cfg["num_sound_pack"]),
 			}
 			with open(ini_path, "w", encoding="utf-8") as f:
 				cp.write(f)
@@ -319,10 +364,13 @@ def delete_profile(profile_name):
 	profile_name = str(profile_name).lower().replace(".exe", "").strip()
 	if profile_name == "default":
 		return
-	ini_path = get_app_profile_path(profile_name)
+	ini_path = get_app_profile_path(profile_name, create=False)
 	if os.path.isfile(ini_path):
 		try:
 			os.remove(ini_path)
+			p_dir = get_profiles_dir(create=False)
+			if os.path.isdir(p_dir) and not os.listdir(p_dir):
+				os.rmdir(p_dir)
 		except Exception as e:
 			logHandler.log.exception("Error deleting profile ini for %s: %s" % (profile_name, e))
 
@@ -335,14 +383,24 @@ def get_effective_config(app_name=None):
 		return load_profile(app_name)
 	return load_profile("default")
 
-def IsTypingProtected():
+def get_active_profile_name():
 	focus = api.getFocusObject()
 	app_name = focus.appModule.appName if focus and hasattr(focus, 'appModule') and focus.appModule else None
-	cfg = get_effective_config(app_name)
-	if cfg["speak_on_protected"]:
+	if app_name:
+		clean_name = str(app_name).lower().replace(".exe", "").strip()
+		ini_path = get_app_profile_path(clean_name)
+		if os.path.isfile(ini_path):
+			return clean_name
+	return "default"
+
+def IsTypingProtected():
+	if _cached_speak_on_protected:
 		return False
-	if focus and focus.isProtected:
-		return True
+	try:
+		return typingProtected()
+	except Exception:
+		focus = api.getFocusObject()
+		return bool(focus and getattr(focus, 'isProtected', False))
 
 def confinit():
 	sounds = get_sounds_folders()
@@ -353,15 +411,12 @@ def confinit():
 		"typingsnd": "boolean(default=true)",
 		"typing_sound": f"string(default={default_sound})",
 		"speak_on_protected": "boolean(default=True)",
+		"protected_symbol": "string(default='')",
 		"num_sound_mode": "integer(default=1, min=0, max=2)",
 		"num_speak_on_protected": "integer(default=1, min=0, max=2)",
 		"num_sound_pack": f"string(default={default_num_pack})"
 	}
 	config.confspec["TypingSFX"] = confspec
-	config.confspec[CONFIG_SECTION_WHOLE_WORD] = {
-		"enabled": "boolean(default=True)",
-		"maxWordLength": "integer(default=100, min=1, max=1000)"
-	}
 
 confinit()
 
@@ -540,16 +595,21 @@ class SoundProfileSettingsDialog(wx.Dialog):
 		self.speakPasswords = sHelper.addItem(wx.Choice(self, choices=[_("Off"), _("On")]))
 		self.speakPasswords.SetSelection(1 if self.cfg["speak_on_protected"] else 0)
 
+		self.protected_symbol_label = sHelper.addItem(wx.StaticText(self, label=_("Custom protected field text (leave blank for default):")))
+		self.protectedSymbolText = sHelper.addItem(wx.TextCtrl(self, value=str(self.cfg.get("protected_symbol", ""))))
+
 		self.OnChangeTypingSounds(None)
 		self.onChange(None)
 		self.onNumPackChange(None)
 		self.OnNumSoundModeChange(None)
+		self.OnChangeSpeakPasswords(None)
 		self.playTypingSounds.Bind(wx.EVT_CHOICE, self.OnChangeTypingSounds)
 		self.typingSound.Bind(wx.EVT_CHOICE, self.onChange)
 		self.sounds.Bind(wx.EVT_CHOICE, self.onPlay)
 		self.num_sound_mode_choice.Bind(wx.EVT_CHOICE, self.OnNumSoundModeChange)
 		self.num_sound_pack_choice.Bind(wx.EVT_CHOICE, self.onNumPackChange)
 		self.num_sounds_choice.Bind(wx.EVT_CHOICE, self.onNumSoundPlay)
+		self.speakPasswords.Bind(wx.EVT_CHOICE, self.OnChangeSpeakPasswords)
 
 		btnSizer = self.CreateButtonSizer(wx.OK | wx.CANCEL)
 		if btnSizer:
@@ -557,6 +617,11 @@ class SoundProfileSettingsDialog(wx.Dialog):
 		self.SetSizerAndFit(mainSizer)
 		self.playTypingSounds.SetFocus()
 		self.Bind(wx.EVT_BUTTON, self.onSave, id=wx.ID_OK)
+
+	def OnChangeSpeakPasswords(self, evt):
+		is_speak_off = self.speakPasswords.GetSelection() == 0
+		self.protected_symbol_label.Enable(is_speak_off)
+		self.protectedSymbolText.Enable(is_speak_off)
 
 	def OnChangeTypingSounds(self, evt):
 		is_on = self.playTypingSounds.GetSelection() == 1
@@ -602,6 +667,7 @@ class SoundProfileSettingsDialog(wx.Dialog):
 		cfg_data = {
 			"typing_sound": self.typingSound.GetStringSelection(),
 			"speak_on_protected": (self.speakPasswords.GetSelection() == 1),
+			"protected_symbol": self.protectedSymbolText.GetValue().strip(),
 			"typingsnd": (self.playTypingSounds.GetSelection() == 1),
 			"num_sound_mode": self.num_sound_mode_choice.GetSelection(),
 			"num_speak_on_protected": self.num_speak_on_protected_choice.GetSelection(),
@@ -909,19 +975,29 @@ class TypingSettingsPanel(SettingsPanel):
 		self.speakPasswords = sHelper.addItem(wx.Choice(self, choices=[_("Off"), _("On")]))
 		self.speakPasswords.SetSelection(1 if cfg.get("speak_on_protected", True) else 0)
 
+		self.protected_symbol_label = sHelper.addItem(wx.StaticText(self, label=_("Custom protected field text (leave blank for default):")))
+		self.protectedSymbolText = sHelper.addItem(wx.TextCtrl(self, value=str(cfg.get("protected_symbol", ""))))
+
 		self.OnChangeTypingSounds(None)
 		self.onChange(None)
 		self.onNumPackChange(None)
 		self.OnNumSoundModeChange(None)
+		self.OnChangeSpeakPasswords(None)
 		self.playTypingSounds.Bind(wx.EVT_CHOICE, self.OnChangeTypingSounds)
 		self.typingSound.Bind(wx.EVT_CHOICE, self.onChange)
 		self.sounds.Bind(wx.EVT_CHOICE, self.onPlay)
 		self.num_sound_mode_choice.Bind(wx.EVT_CHOICE, self.OnNumSoundModeChange)
 		self.num_sound_pack_choice.Bind(wx.EVT_CHOICE, self.onNumPackChange)
 		self.num_sounds_choice.Bind(wx.EVT_CHOICE, self.onNumSoundPlay)
+		self.speakPasswords.Bind(wx.EVT_CHOICE, self.OnChangeSpeakPasswords)
 
 	def postInit(self):
 		self.playTypingSounds.SetFocus()
+
+	def OnChangeSpeakPasswords(self, evt):
+		is_speak_off = self.speakPasswords.GetSelection() == 0
+		self.protected_symbol_label.Enable(is_speak_off)
+		self.protectedSymbolText.Enable(is_speak_off)
 
 	def OnChangeTypingSounds(self, evt):
 		is_on = self.playTypingSounds.GetSelection() == 1
@@ -967,6 +1043,7 @@ class TypingSettingsPanel(SettingsPanel):
 		cfg_data = {
 			"typing_sound": self.typingSound.GetStringSelection(),
 			"speak_on_protected": (self.speakPasswords.GetSelection() == 1),
+			"protected_symbol": self.protectedSymbolText.GetValue().strip(),
 			"typingsnd": (self.playTypingSounds.GetSelection() == 1),
 			"num_sound_mode": self.num_sound_mode_choice.GetSelection(),
 			"num_speak_on_protected": self.num_speak_on_protected_choice.GetSelection(),
@@ -975,38 +1052,12 @@ class TypingSettingsPanel(SettingsPanel):
 		target = getattr(self, "target_profile", "default")
 		save_profile(target, cfg_data)
 
-class WholeWordEchoSettingsPanel(SettingsPanel):
-	title = _("Whole word echo")
-
-	def makeSettings(self, settingsSizer):
-		helper = guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
-		label = _("Announce the &whole word, even if it was corrected while typing")
-		self.enabledCheckBox = helper.addItem(wx.CheckBox(self, label=label))
-		self.enabledCheckBox.SetValue(is_whole_word_echo_enabled())
-		helper.addItem(
-			wx.StaticText(
-				self,
-				label=_(
-					"This option only has an effect when typed word echo is enabled "
-					"in NVDA keyboard settings.",
-				),
-			),
-		)
-
-	def onSave(self):
-		try:
-			config.conf[CONFIG_SECTION_WHOLE_WORD]["enabled"] = self.enabledCheckBox.GetValue()
-			config.conf.save()
-		except Exception as e:
-			logHandler.log.exception("Error saving wholeWordEcho settings: %s" % e)
-
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	last_active_app = "default"
 
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 		NVDASettingsDialog.categoryClasses.append(TypingSettingsPanel)
-		NVDASettingsDialog.categoryClasses.append(WholeWordEchoSettingsPanel)
 		self.number_sounds = {}
 		self.current_number_pack = None
 		self.toolsMenuItem = None
@@ -1060,17 +1111,112 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def IsEditable(self, object):
 		if not object:
 			return False
+		try:
+			if hasattr(object, 'isEditable') and object.isEditable:
+				return True
+			if hasattr(controlTypes, 'Role') and hasattr(controlTypes.Role, 'TERMINAL') and object.role == controlTypes.Role.TERMINAL:
+				return True
+			if hasattr(controlTypes, 'ROLE_TERMINAL') and object.role == controlTypes.ROLE_TERMINAL:
+				return True
+		except Exception:
+			pass
 		return (object.role in controls or STATE_EDITABLE in object.states) and not STATE_READONLY in object.states
 
+	def AcceptsTabCharacter(self, obj, focus=None):
+		target = focus or obj
+		if not target:
+			return False
+
+		if getattr(target, 'isProtected', False) or (obj and getattr(obj, 'isProtected', False)):
+			return False
+		states = getattr(target, 'states', set())
+		if hasattr(controlTypes, 'State'):
+			if hasattr(controlTypes.State, 'PROTECTED') and controlTypes.State.PROTECTED in states:
+				return False
+		if hasattr(controlTypes, 'STATE_PROTECTED') and controlTypes.STATE_PROTECTED in states:
+			return False
+
+		app_name = ""
+		for o in (target, obj, focus):
+			if o and hasattr(o, 'appModule') and o.appModule and hasattr(o.appModule, 'appName'):
+				app_name = str(o.appModule.appName).lower().replace(".exe", "").strip()
+				if app_name:
+					break
+
+		non_tab_apps = {
+			"chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "waterfox",
+			"whatsapp", "telegram", "discord", "slack", "teams", "skype"
+		}
+		if app_name in non_tab_apps:
+			w_class = str(getattr(target, 'windowClassName', '') or '')
+			role = getattr(target, 'role', None)
+			is_terminal = False
+			if hasattr(controlTypes, 'Role') and hasattr(controlTypes.Role, 'TERMINAL') and role == controlTypes.Role.TERMINAL:
+				is_terminal = True
+			if hasattr(controlTypes, 'ROLE_TERMINAL') and role == controlTypes.ROLE_TERMINAL:
+				is_terminal = True
+			if not is_terminal and "Scintilla" not in w_class:
+				return False
+
+		tab_editor_apps = {
+			"notepad", "winword", "wordpad", "code", "devenv", "notepad++", "sublime_text",
+			"idea64", "pycharm64", "clion64", "webstorm64", "rider64", "studio64", "datagrip64",
+			"goland64", "rubymine64", "phpstorm64", "eclipse", "soffice.bin", "textpad",
+			"ultraedit", "geany", "notepad2", "notepad3", "cmd", "powershell",
+			"windowsterminal", "mintty", "conhost", "bash"
+		}
+		if app_name in tab_editor_apps:
+			return self.IsEditable(target)
+
+		w_class = str(getattr(target, 'windowClassName', '') or '')
+		if "Scintilla" in w_class:
+			return self.IsEditable(target)
+
+		hwnd = getattr(target, 'windowHandle', None) or (obj and getattr(obj, 'windowHandle', None))
+		if hwnd:
+			try:
+				dlg_code = ctypes.windll.user32.SendMessageW(hwnd, 0x0087, 0x09, 0)
+				if dlg_code & 0x0002:
+					return self.IsEditable(target)
+			except Exception:
+				pass
+
+		role = getattr(target, 'role', None)
+		if hasattr(controlTypes, 'Role') and hasattr(controlTypes.Role, 'TERMINAL') and role == controlTypes.Role.TERMINAL:
+			return self.IsEditable(target)
+		if hasattr(controlTypes, 'ROLE_TERMINAL') and role == controlTypes.ROLE_TERMINAL:
+			return self.IsEditable(target)
+
+		return False
+
 	def event_gainFocus(self, object, nextHandler):
+		global _cached_speak_on_protected
 		api.isTypingProtected = IsTypingProtected
 		if object and hasattr(object, 'appModule') and object.appModule:
 			app = str(object.appModule.appName).lower().replace(".exe", "").strip()
 			if app and app != "nvda":
 				GlobalPlugin.last_active_app = app
+		try:
+			app_name = object.appModule.appName if object and hasattr(object, 'appModule') and object.appModule else None
+			cfg = get_effective_config(app_name)
+			_cached_speak_on_protected = bool(cfg.get("speak_on_protected", True))
+		except Exception:
+			_cached_speak_on_protected = True
 		nextHandler()
 
 	def event_typedCharacter(self, obj, nextHandler, ch):
+		if not ch or ch == "\x1b" or (len(ch) == 1 and ord(ch) == 27):
+			nextHandler()
+			return
+
+		focus = api.getFocusObject()
+		is_protected = bool((focus and getattr(focus, 'isProtected', False)) or (obj and getattr(obj, 'isProtected', False)))
+
+		if ch == "\t" or (len(ch) == 1 and ord(ch) == 9):
+			if not self.AcceptsTabCharacter(obj, focus):
+				nextHandler()
+				return
+
 		try:
 			self._speakWholeWord(obj, ch)
 		except Exception:
@@ -1081,19 +1227,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 		self.load_number_sounds(cfg["num_sound_pack"])
 
+		custom_sym = cfg.get("protected_symbol", "").strip() if not cfg["speak_on_protected"] else ""
+
 		num_sound_mode = cfg["num_sound_mode"]
+		num_played = False
 		if num_sound_mode != 0:
 			num_speak_on_protected = cfg["num_speak_on_protected"]
-			focus = api.getFocusObject()
 			mode = num_sound_mode
-			if focus and focus.isProtected:
+			if is_protected:
 				mode = num_speak_on_protected
-			if mode != 0 and self.IsEditable(focus) and ch.isdigit():
+			if mode != 0 and self.IsEditable(focus or obj) and ch.isdigit():
 				sound_path = self.number_sounds.get(ch)
 				if not sound_path:
 					sound_path = self.number_sounds.get("default")
 				if sound_path:
 					nvwave.playWaveFile(sound_path, True)
+					num_played = True
 					if mode == 1:
 						_suppress_digit_info["char"] = ch
 						_suppress_digit_info["time"] = time.time()
@@ -1101,10 +1250,25 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 						_append_to_typed_word_buffer(ch)
 						return
 					elif mode == 2:
+						if is_protected and custom_sym:
+							speech.cancelSpeech()
+							speech.speakText(custom_sym)
+							return
 						nextHandler()
 						return
 
-		if self.IsEditable(obj) and cfg["typingsnd"]:
+		if is_protected and custom_sym and ch not in ("\b", "\r", "\n", "\t", "\x1b"):
+			if self.IsEditable(obj) and cfg["typingsnd"] and not num_played:
+				sound_dir = os.path.join(effects_dir, cfg["typing_sound"])
+				if ch == " ":
+					nvwave.playWaveFile(os.path.join(sound_dir, "space.wav"), True)
+				else:
+					nvwave.playWaveFile(os.path.join(sound_dir, "typing.wav"), True)
+			speech.cancelSpeech()
+			speech.speakText(custom_sym)
+			return
+
+		if self.IsEditable(obj) and cfg["typingsnd"] and not num_played:
 			sound_dir = os.path.join(effects_dir, cfg["typing_sound"])
 			if ch == " ":
 				nvwave.playWaveFile(os.path.join(sound_dir, "space.wav"), True)
@@ -1117,9 +1281,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		nextHandler()
 
 	def _speakWholeWord(self, obj, ch: str) -> None:
-		if not is_whole_word_echo_enabled():
-			return
-		if not ch or ch in ("\b", "\u007f") or _isWordChar(ch):
+		if not ch or ch in ("\b", "\u007f", "\x1b") or (len(ch) == 1 and ord(ch) == 27) or _isWordChar(ch):
 			return
 		if api.isTypingProtected():
 			return
@@ -1128,31 +1290,30 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			return
 		if not _isTypedWordEchoEnabled():
 			return
-		if self._isTerminal(obj):
-			return
 		bufferedWord = "".join(buf)
 		word = self._getWordBeforeCaret(obj)
 		if not word or word == bufferedWord:
 			return
-		if len(word) > get_whole_word_max_length():
+		if len(word) > 100:
 			return
 		if not word.endswith(bufferedWord):
 			return
 		speech.clearTypedWordBuffer()
 		speech.speakText(word)
 
-	def _isTerminal(self, obj) -> bool:
-		try:
-			return obj.role == controlTypes.Role.TERMINAL
-		except AttributeError:
-			return False
-
 	def _getWordBeforeCaret(self, obj) -> str:
 		if obj is None:
 			obj = api.getFocusObject()
+		if not obj:
+			return ""
 		try:
 			caret = obj.makeTextInfo(textInfos.POSITION_CARET)
 		except Exception:
+			try:
+				caret = obj.makeTextInfo(textInfos.POSITION_SELECTION)
+			except Exception:
+				caret = None
+		if not caret:
 			return ""
 		try:
 			lineStart = caret.copy()
@@ -1163,47 +1324,29 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			word = _trailingWord(text)
 			if word:
 				return word
-			previousLine = caret.copy()
-			if previousLine.move(textInfos.UNIT_LINE, -1) != 0:
-				previousLine.expand(textInfos.UNIT_LINE)
-				return _trailingWord(previousLine.text or "")
 		except Exception:
 			pass
 		return ""
 
-	@script(
-		description=_("Toggles announcing the whole word when typing"),
-		gesture=None,
-	)
-	def script_toggleWholeWordEcho(self, gesture):
-		enabled = not is_whole_word_echo_enabled()
-		try:
-			config.conf[CONFIG_SECTION_WHOLE_WORD]["enabled"] = enabled
-			config.conf.save()
-		except Exception:
-			pass
-		if enabled:
-			message(_("Whole word echo on"))
-		else:
-			message(_("Whole word echo off"))
-
 	@script(description=_("Toggles the typing sounds mode."), category=_("Typing SFX"), gestures=["kb:nvda+shift+k"])
 	def script_toggle_typing_sounds(self, gesture):
-		base_sec = get_base_config_section()
-		current = base_sec.get("typingsnd", True)
+		target_profile = get_active_profile_name()
+		cfg = load_profile(target_profile)
+		current = cfg["typingsnd"]
 		new_val = not current
-		save_profile("default", {"typingsnd": new_val})
+		save_profile(target_profile, {"typingsnd": new_val})
 		message(_("typing sounds off") if not new_val else _("typing sounds on"))
 
 	@script(description=_("Toggles the Number sounds mode."), category=_("Typing SFX"), gesture="kb:nvda+shift+n")
 	def script_toggleNumSounds(self, gesture):
-		base_sec = get_base_config_section()
+		target_profile = get_active_profile_name()
+		cfg = load_profile(target_profile)
 		try:
-			num_sound_mode = int(base_sec.get("num_sound_mode", 1))
+			num_sound_mode = int(cfg["num_sound_mode"])
 		except Exception:
 			num_sound_mode = 1
 		num_sound_mode = (num_sound_mode + 1) % 3
-		save_profile("default", {"num_sound_mode": num_sound_mode})
+		save_profile(target_profile, {"num_sound_mode": num_sound_mode})
 		if num_sound_mode == 0:
 			message(_("Number sound off"))
 		elif num_sound_mode == 1:
@@ -1213,20 +1356,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	@script(description=_("Toggles the protected sounds mode."), category=_("Typing SFX"), gesture="kb:nvda+shift+o")
 	def script_toggleNumProtectedSounds(self, gesture):
-		base_sec = get_base_config_section()
+		target_profile = get_active_profile_name()
+		cfg = load_profile(target_profile)
 		try:
-			num_sound_mode = int(base_sec.get("num_sound_mode", 1))
+			num_sound_mode = int(cfg["num_sound_mode"])
 		except Exception:
 			num_sound_mode = 1
 		if num_sound_mode == 0:
 			message(_("please enable the number sound first"))
 			return
 		try:
-			num_speak_on_protected = int(base_sec.get("num_speak_on_protected", 1))
+			num_speak_on_protected = int(cfg["num_speak_on_protected"])
 		except Exception:
 			num_speak_on_protected = 1
 		num_speak_on_protected = (num_speak_on_protected + 1) % 3
-		save_profile("default", {"num_speak_on_protected": num_speak_on_protected})
+		save_profile(target_profile, {"num_speak_on_protected": num_speak_on_protected})
 		if num_speak_on_protected == 0:
 			message(_("Protected number sound off"))
 		elif num_speak_on_protected == 1:
@@ -1236,10 +1380,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	@script(description=_("Toggles the protected Speak mode."), category=_("Typing SFX"), gestures=["kb:nvda+shift+p"])
 	def script_toggle_speak_passwords(self, gesture):
-		base_sec = get_base_config_section()
-		current = base_sec.get("speak_on_protected", True)
+		global _cached_speak_on_protected
+		target_profile = get_active_profile_name()
+		cfg = load_profile(target_profile)
+		current = cfg["speak_on_protected"]
 		new_val = not current
-		save_profile("default", {"speak_on_protected": new_val})
+		save_profile(target_profile, {"speak_on_protected": new_val})
+		_cached_speak_on_protected = new_val
 		message(_("speak passwords off") if not new_val else _("speak passwords on"))
 
 	def terminate(self):
@@ -1252,9 +1399,5 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				pass
 		try:
 			NVDASettingsDialog.categoryClasses.remove(TypingSettingsPanel)
-		except ValueError:
-			pass
-		try:
-			NVDASettingsDialog.categoryClasses.remove(WholeWordEchoSettingsPanel)
 		except ValueError:
 			pass
