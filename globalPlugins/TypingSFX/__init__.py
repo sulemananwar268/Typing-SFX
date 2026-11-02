@@ -4,6 +4,7 @@ import speech
 import config
 import os
 import glob
+import random
 import wx
 import ctypes
 import configparser
@@ -1060,6 +1061,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		NVDASettingsDialog.categoryClasses.append(TypingSettingsPanel)
 		self.number_sounds = {}
 		self.current_number_pack = None
+		self.typing_sounds = {}
+		self.current_typing_pack = None
+		self._last_played_sound = {}
 		self.toolsMenuItem = None
 
 		try:
@@ -1107,6 +1111,81 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 					self.number_sounds[str(i)] = os.path.join(path, f"{i}.wav")
 			if os.path.exists(os.path.join(path, "Numbering.wav")):
 				self.number_sounds["default"] = os.path.join(path, "Numbering.wav")
+
+	def load_typing_sounds(self, pack_name):
+		if self.current_typing_pack == pack_name and self.typing_sounds:
+			return
+		self.current_typing_pack = pack_name
+		self.typing_sounds = {
+			"space": [],
+			"delete": [],
+			"return": [],
+			"letter": [],
+			"number": [],
+			"typing": [],
+		}
+		path = os.path.join(effects_dir, pack_name)
+		if not os.path.isdir(path):
+			return
+		try:
+			files = sorted(os.listdir(path))
+		except Exception:
+			return
+		all_wavs = []
+		for f in files:
+			if not f.lower().endswith(".wav"):
+				continue
+			full_path = os.path.join(path, f)
+			if not os.path.isfile(full_path):
+				continue
+			all_wavs.append(full_path)
+			stem = f[:-4].lower().strip()
+			if stem.startswith("space") or "spaceba" in stem or "spacebar" in stem:
+				self.typing_sounds["space"].append(full_path)
+			elif stem.startswith("delete") or stem.startswith("backspace") or stem in ("del", "bs"):
+				self.typing_sounds["delete"].append(full_path)
+			elif stem.startswith("return") or stem.startswith("enter") or stem in ("bill", "bell", "cr"):
+				self.typing_sounds["return"].append(full_path)
+			elif stem.startswith("letter"):
+				self.typing_sounds["letter"].append(full_path)
+			elif stem.startswith("number") or stem.startswith("digit"):
+				self.typing_sounds["number"].append(full_path)
+			else:
+				self.typing_sounds["typing"].append(full_path)
+		if not self.typing_sounds["typing"]:
+			if self.typing_sounds["letter"]:
+				self.typing_sounds["typing"] = list(self.typing_sounds["letter"])
+			elif all_wavs:
+				self.typing_sounds["typing"] = list(all_wavs)
+
+	def _pick_sound(self, category):
+		candidates = self.typing_sounds.get(category)
+		if not candidates:
+			candidates = self.typing_sounds.get("typing", [])
+		if not candidates:
+			return None
+		if len(candidates) == 1:
+			return candidates[0]
+		last = self._last_played_sound.get(category)
+		pool = [s for s in candidates if s != last]
+		chosen = random.choice(pool if pool else candidates)
+		self._last_played_sound[category] = chosen
+		return chosen
+
+	def _get_typing_sound_for_char(self, ch):
+		if ch == " ":
+			return self._pick_sound("space")
+		elif ch in ("\b", "\u007f"):
+			return self._pick_sound("delete")
+		elif ord(ch) == 13 or ch == "\n":
+			if self.typing_sounds.get("return"):
+				return self._pick_sound("return")
+			return self._pick_sound("typing")
+		elif ch.isdigit() and self.typing_sounds.get("number"):
+			return self._pick_sound("number")
+		elif ch.isalpha() and self.typing_sounds.get("letter"):
+			return self._pick_sound("letter")
+		return self._pick_sound("typing")
 
 	def IsEditable(self, object):
 		if not object:
@@ -1259,25 +1338,19 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 		if is_protected and custom_sym and ch not in ("\b", "\r", "\n", "\t", "\x1b"):
 			if self.IsEditable(obj) and cfg["typingsnd"] and not num_played:
-				sound_dir = os.path.join(effects_dir, cfg["typing_sound"])
-				if ch == " ":
-					nvwave.playWaveFile(os.path.join(sound_dir, "space.wav"), True)
-				else:
-					nvwave.playWaveFile(os.path.join(sound_dir, "typing.wav"), True)
+				self.load_typing_sounds(cfg["typing_sound"])
+				sound_to_play = self._get_typing_sound_for_char(ch)
+				if sound_to_play and os.path.isfile(sound_to_play):
+					nvwave.playWaveFile(sound_to_play, True)
 			speech.cancelSpeech()
 			speech.speakText(custom_sym)
 			return
 
 		if self.IsEditable(obj) and cfg["typingsnd"] and not num_played:
-			sound_dir = os.path.join(effects_dir, cfg["typing_sound"])
-			if ch == " ":
-				nvwave.playWaveFile(os.path.join(sound_dir, "space.wav"), True)
-			elif ch == "\b":
-				nvwave.playWaveFile(os.path.join(sound_dir, "delete.wav"), True)
-			elif os.path.isfile(os.path.join(sound_dir, "return.wav")) and (ord(ch) == 13 or ch == "\n"):
-				nvwave.playWaveFile(os.path.join(sound_dir, "return.wav"), True)
-			else:
-				nvwave.playWaveFile(os.path.join(sound_dir, "typing.wav"), True)
+			self.load_typing_sounds(cfg["typing_sound"])
+			sound_to_play = self._get_typing_sound_for_char(ch)
+			if sound_to_play and os.path.isfile(sound_to_play):
+				nvwave.playWaveFile(sound_to_play, True)
 		nextHandler()
 
 	def _speakWholeWord(self, obj, ch: str) -> None:
